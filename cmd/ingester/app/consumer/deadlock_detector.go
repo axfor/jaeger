@@ -131,7 +131,7 @@ func (s *deadlockDetector) monitorForPartition(w *partitionDeadlockDetector, par
 }
 
 // start monitors that the sum of messages consumed across all partitions is non zero for the given interval
-// If it is zero when there are producers producing messages on the topic, it means that sarama-cluster hasn't
+// If it is zero when there are producers producing messages on the topic, it means that sarama hasn't
 // retrieved partition assignments. (This case will not be caught by startMonitoringForPartition because no partitions
 // were retrieved).
 func (s *deadlockDetector) start() {
