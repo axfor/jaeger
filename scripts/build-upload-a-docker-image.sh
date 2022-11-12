@@ -61,7 +61,7 @@ else
     fi
 fi
 
-docker buildx build --output "${PUSHTAG}" \
+docker  build --output "${PUSHTAG}" \
 	--progress=plain ${target_arg} ${base_debug_img_arg}\
 	--platform=${platforms} \
 	--file ${docker_file_arg} \
