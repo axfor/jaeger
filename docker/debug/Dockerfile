@@ -9,6 +9,8 @@ RUN apk add --update --no-cache ca-certificates make git build-base mailcap
 RUN if [[ "$TARGETARCH" == "s390x"  ||  "$TARGETARCH" == "ppc64le" ]] ; then \
 	touch /go/bin/dlv; \
     else \
+        export GO111MODULE=on; \
+        export GOPROXY=https://goproxy.cn; \
         go install github.com/go-delve/delve/cmd/dlv@latest; \
     fi
 

@@ -276,24 +276,8 @@ build-binaries-ppc64le:
 	GOOS=linux GOARCH=ppc64le $(MAKE) build-platform-binaries
 
 .PHONY: build-platform-binaries
-build-platform-binaries: build-agent \
-	build-agent-debug \
-	build-collector \
-	build-collector-debug \
-	build-query \
-	build-query-debug \
-	build-ingester \
-	build-ingester-debug \
-	build-remote-storage \
-	build-remote-storage-debug \
-	build-all-in-one \
-	build-all-in-one-debug \
-	build-examples \
-	build-tracegen \
-	build-anonymizer \
-	build-esmapping-generator \
-	build-es-index-cleaner \
-	build-es-rollover
+build-platform-binaries: build-collector \
+	build-ingester
 
 .PHONY: build-all-platforms
 build-all-platforms: build-binaries-linux build-binaries-windows build-binaries-darwin build-binaries-darwin-arm64 build-binaries-s390x build-binaries-arm64 build-binaries-ppc64le
@@ -318,18 +302,17 @@ docker-images-jaeger-backend-debug: SUFFIX = -debug
 
 .PHONY: docker-images-jaeger-backend docker-images-jaeger-backend-debug
 docker-images-jaeger-backend docker-images-jaeger-backend-debug: create-baseimg create-debugimg
-	for component in "jaeger-agent" "jaeger-collector" "jaeger-query" "jaeger-ingester" "all-in-one" ; do \
+	for component in "jaeger-collector" "jaeger-ingester" ; do \
 		regex="jaeger-(.*)"; \
 		component_suffix=$$component; \
 		if [[ $$component =~ $$regex ]]; then \
 			component_suffix="$${BASH_REMATCH[1]}"; \
 		fi; \
-		docker buildx build --target $(TARGET) \
+		docker  build --target $(TARGET) \
 			--tag $(DOCKER_NAMESPACE)/$$component$(SUFFIX):${DOCKER_TAG} \
 			--build-arg base_image=$(BASE_IMAGE) \
 			--build-arg debug_image=$(DEBUG_IMAGE) \
 			--build-arg TARGETARCH=$(GOARCH) \
-			--load \
 			cmd/$$component_suffix; \
 		echo "Finished building $$component ==============" ; \
 	done;
