@@ -1,0 +1,46 @@
+name: CIT Kafka
+
+on:
+  push:
+    branches: [axfor-patch-1]
+
+  pull_request:
+    branches: [axfor-patch-1]
+
+# See https://github.com/ossf/scorecard/blob/main/docs/checks.md#token-permissions
+permissions:  # added using https://github.com/step-security/secure-workflows
+  contents: read
+
+jobs:
+  kafka:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@1f99358870fe1c846a3ccba386cc2b2246836776
+      with:
+        egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+    - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+
+    - uses: actions/setup-go@4d34df0c2316fe8122ab82dc22947d607c0c91f9
+      with:
+        go-version: 1.20.x
+
+    - name: Run kafka integration tests
+      run: bash scripts/kafka-integration-test.sh
+
+    services:
+      zookeeper:
+        image: bitnami/zookeeper
+        ports:
+          - 2181:2181
+        env:
+          ALLOW_ANONYMOUS_LOGIN: yes
+      kafka:
+        image: bitnami/kafka
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          ALLOW_PLAINTEXT_LISTENER: yes
+          KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
