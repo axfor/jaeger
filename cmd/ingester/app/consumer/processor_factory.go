@@ -19,6 +19,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/Shopify/sarama"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/consumer/offset"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor/decorator"
@@ -61,14 +62,18 @@ func NewProcessorFactory(params ProcessorFactoryParams) (*ProcessorFactory, erro
 	}, nil
 }
 
-func (c *ProcessorFactory) new(partition int32, minOffset int64) processor.SpanProcessor {
-	c.logger.Info("Creating new processors", zap.Int32("partition", partition))
+func (c *ProcessorFactory) new(
+	session sarama.ConsumerGroupSession,
+	claim sarama.ConsumerGroupClaim,
+	minOffset int64) processor.SpanProcessor {
 
-	markOffset := func(offset int64) {
-		c.consumer.MarkPartitionOffset(c.topic, partition, offset, "")
+	c.logger.Info("Creating new processors", zap.Int32("partition", claim.Partition()))
+
+	markOffsetFunc := func(offset int64) {
+		session.MarkOffset(claim.Topic(), claim.Partition(), offset, "")
 	}
 
-	om := offset.NewManager(minOffset, markOffset, partition, c.metricsFactory)
+	om := offset.NewManager(minOffset, markOffsetFunc, claim.Partition(), c.metricsFactory)
 
 	retryProcessor := decorator.NewRetryingProcessor(c.metricsFactory, c.baseProcessor, c.retryOptions...)
 	cp := NewCommittingProcessor(retryProcessor, om)
