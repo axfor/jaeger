@@ -65,8 +65,8 @@ func NewProcessorFactory(params ProcessorFactoryParams) (*ProcessorFactory, erro
 func (c *ProcessorFactory) new(
 	session sarama.ConsumerGroupSession,
 	claim sarama.ConsumerGroupClaim,
-	minOffset int64) processor.SpanProcessor {
-
+	minOffset int64,
+) processor.SpanProcessor {
 	c.logger.Info("Creating new processors", zap.Int32("partition", claim.Partition()))
 
 	markOffsetFunc := func(offset int64) {

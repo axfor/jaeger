@@ -99,7 +99,7 @@ func (s *KafkaIntegrationTestSuite) initialize() error {
 	}
 	spanConsumer.Start()
 
-	//wait consumer running
+	// wait consumer running
 	spanConsumer.Ready()
 
 	s.SpanWriter = spanWriter
