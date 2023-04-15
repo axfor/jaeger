@@ -16,15 +16,12 @@ package consumer
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"go.uber.org/zap"
 
-	kmocks "github.com/jaegertracing/jaeger/cmd/ingester/app/consumer/mocks"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor/mocks"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
+	"github.com/jaegertracing/jaeger/pkg/testutils"
 )
 
 func Test_NewFactory(t *testing.T) {
@@ -32,37 +29,6 @@ func Test_NewFactory(t *testing.T) {
 	newFactory, err := NewProcessorFactory(params)
 	assert.NoError(t, err)
 	assert.NotNil(t, newFactory)
-}
-
-func Test_new(t *testing.T) {
-	mockConsumer := &kmocks.Consumer{}
-	mockConsumer.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	topic := "coelacanth"
-	partition := int32(21)
-	offset := int64(555)
-
-	sp := &mocks.SpanProcessor{}
-	sp.On("Process", mock.Anything).Return(nil)
-
-	pf := ProcessorFactory{
-		topic:          topic,
-		consumer:       mockConsumer,
-		metricsFactory: metrics.NullFactory,
-		logger:         zap.NewNop(),
-		baseProcessor:  sp,
-		parallelism:    1,
-	}
-
-	processor := pf.new(partition, offset)
-	msg := &kmocks.Message{}
-	msg.On("Offset").Return(offset + 1)
-	processor.Process(msg)
-
-	// This sleep is greater than offset manager's resetInterval to allow it a chance to
-	// call MarkPartitionOffset.
-	time.Sleep(150 * time.Millisecond)
-	mockConsumer.AssertCalled(t, "MarkPartitionOffset", topic, partition, offset+1, "")
 }
 
 type fakeService struct {
@@ -90,8 +56,24 @@ func (f *fakeProcessor) Start() {
 
 type fakeMsg struct{}
 
+func (f *fakeMsg) Key() []byte {
+	return []byte("1")
+}
+
 func (f *fakeMsg) Value() []byte {
 	return nil
+}
+
+func (f *fakeMsg) Topic() string {
+	return "test"
+}
+
+func (f *fakeMsg) Partition() int32 {
+	return 0
+}
+
+func (f *fakeMsg) Offset() int64 {
+	return 1
 }
 
 func Test_startedProcessor_Process(t *testing.T) {
@@ -112,4 +94,63 @@ func Test_startedProcessor_Process(t *testing.T) {
 	s.Close()
 	assert.True(t, service.closeCalled)
 	processor.AssertExpectations(t)
+}
+
+type fakeConsumerGroupSession struct {
+	topic     string
+	partition int32
+	offset    int64
+}
+
+func (s *fakeConsumerGroupSession) MarkOffset(topic string, partition int32, offset int64, metadata string) {
+	s.topic = topic
+	s.partition = partition
+	s.offset = offset
+}
+
+type fakeConsumerGroupClaim struct{}
+
+func (c *fakeConsumerGroupClaim) Topic() string {
+	return ""
+}
+
+func (c *fakeConsumerGroupClaim) Partition() int32 {
+	return 0
+}
+
+func Test_New(t *testing.T) {
+	logger, logBuf := testutils.NewLogger()
+
+	processor := &fakeProcessor{}
+	processor.On("Close").Return(nil)
+
+	factoryParams := ProcessorFactoryParams{
+		Topic:         topic,
+		Parallelism:   1,
+		BaseProcessor: processor,
+		Logger:        logger,
+		Factory:       metrics.NullFactory,
+	}
+
+	newFactory, err := NewProcessorFactory(factoryParams)
+	assert.NoError(t, err)
+	assert.NotNil(t, newFactory)
+
+	session := &fakeConsumerGroupSession{}
+	claim := &fakeConsumerGroupClaim{}
+
+	sp := newFactory.new(session, claim, 0)
+
+	msg := &fakeMsg{}
+	processor.On("Process", msg).Return(nil)
+	err = sp.Process(msg)
+	assert.NoError(t, err)
+
+	sp.Close()
+
+	assert.True(t, session.topic == msg.Topic())
+	assert.True(t, session.partition == msg.Partition())
+	assert.True(t, session.offset == msg.Offset())
+
+	t.Logf("processor all logs: %s", logBuf.String())
 }
