@@ -16,15 +16,10 @@ package consumer
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"go.uber.org/zap"
 
-	kmocks "github.com/jaegertracing/jaeger/cmd/ingester/app/consumer/mocks"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor/mocks"
-	"github.com/jaegertracing/jaeger/pkg/metrics"
 )
 
 func Test_NewFactory(t *testing.T) {
@@ -32,37 +27,6 @@ func Test_NewFactory(t *testing.T) {
 	newFactory, err := NewProcessorFactory(params)
 	assert.NoError(t, err)
 	assert.NotNil(t, newFactory)
-}
-
-func Test_new(t *testing.T) {
-	mockConsumer := &kmocks.Consumer{}
-	mockConsumer.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	topic := "coelacanth"
-	partition := int32(21)
-	offset := int64(555)
-
-	sp := &mocks.SpanProcessor{}
-	sp.On("Process", mock.Anything).Return(nil)
-
-	pf := ProcessorFactory{
-		topic:          topic,
-		consumer:       mockConsumer,
-		metricsFactory: metrics.NullFactory,
-		logger:         zap.NewNop(),
-		baseProcessor:  sp,
-		parallelism:    1,
-	}
-
-	processor := pf.new(partition, offset)
-	msg := &kmocks.Message{}
-	msg.On("Offset").Return(offset + 1)
-	processor.Process(msg)
-
-	// This sleep is greater than offset manager's resetInterval to allow it a chance to
-	// call MarkPartitionOffset.
-	time.Sleep(150 * time.Millisecond)
-	mockConsumer.AssertCalled(t, "MarkPartitionOffset", topic, partition, offset+1, "")
 }
 
 type fakeService struct {
