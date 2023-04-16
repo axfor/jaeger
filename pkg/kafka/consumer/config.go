@@ -15,11 +15,10 @@
 package consumer
 
 import (
-	"io"
-	"time"
+	"context"
+	"fmt"
 
 	"github.com/Shopify/sarama"
-	cluster "github.com/bsm/sarama-cluster"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/pkg/kafka/auth"
@@ -27,9 +26,9 @@ import (
 
 // Consumer is an interface to features of Sarama that are necessary for the consumer
 type Consumer interface {
-	Partitions() <-chan cluster.PartitionConsumer
-	MarkPartitionOffset(topic string, partition int32, offset int64, metadata string)
-	io.Closer
+	Consume(ctx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error
+	Errors() <-chan error
+	Close() error
 }
 
 // Builder builds a new kafka consumer
@@ -52,8 +51,7 @@ type Configuration struct {
 
 // NewConsumer creates a new kafka consumer
 func (c *Configuration) NewConsumer(logger *zap.Logger) (Consumer, error) {
-	saramaConfig := cluster.NewConfig()
-	saramaConfig.Group.Mode = cluster.ConsumerModePartitions
+	saramaConfig := sarama.NewConfig()
 	saramaConfig.ClientID = c.ClientID
 	saramaConfig.RackID = c.RackID
 	if len(c.ProtocolVersion) > 0 {
@@ -61,15 +59,14 @@ func (c *Configuration) NewConsumer(logger *zap.Logger) (Consumer, error) {
 		if err != nil {
 			return nil, err
 		}
-		saramaConfig.Config.Version = ver
+		saramaConfig.Version = ver
 	}
-	if err := c.AuthenticationConfig.SetConfiguration(&saramaConfig.Config, logger); err != nil {
+	if err := c.AuthenticationConfig.SetConfiguration(saramaConfig, logger); err != nil {
 		return nil, err
 	}
-	// cluster.NewConfig() uses sarama.NewConfig() to create the config.
-	// However the Jaeger OTEL module pulls in newer samara version (from OTEL collector)
-	// that does not set saramaConfig.Consumer.Offsets.CommitInterval to its default value 1s.
-	// then the samara-cluster fails if the default interval is not 1s.
-	saramaConfig.Consumer.Offsets.CommitInterval = time.Second
-	return cluster.NewConsumer(c.Brokers, c.GroupID, []string{c.Topic}, saramaConfig)
+	client, err := sarama.NewConsumerGroup(c.Brokers, c.GroupID, saramaConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error creating consumer group client: %w", err)
+	}
+	return client, nil
 }
