@@ -15,11 +15,13 @@
 package consumer
 
 import (
+	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Shopify/sarama"
-	sc "github.com/bsm/sarama-cluster"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor"
@@ -44,50 +46,120 @@ type Consumer struct {
 	internalConsumer consumer.Consumer
 	processorFactory ProcessorFactory
 
-	deadlockDetector deadlockDetector
+	deadlockDetector *globalDeadlockDetector
 
-	partitionIDToState  map[int32]*consumerState
-	partitionMapLock    sync.Mutex
-	partitionsHeld      int64
+	partitionsHeld      atomic.Int64
 	partitionsHeldGauge metrics.Gauge
 
+	consumerReady *consumerReady
+
 	doneWg sync.WaitGroup
+
+	topic  string
+	cancel context.CancelFunc
 }
 
-type consumerState struct {
-	partitionConsumer sc.PartitionConsumer
+type globalDeadlockDetector struct {
+	*deadlockDetector
+	closeDetectorOnce sync.Once
+	deadlockNotifyCh  chan struct{}
+	closeNotifyOnce   sync.Once
+}
+
+func (ad *globalDeadlockDetector) close() {
+	ad.closeDetectorOnce.Do(func() {
+		ad.deadlockDetector.close()
+	})
+}
+
+func (ad *globalDeadlockDetector) deadlockNotify() <-chan struct{} {
+	return ad.deadlockNotifyCh
+}
+
+func (c *globalDeadlockDetector) markDeadlock() {
+	c.closeNotifyOnce.Do(func() {
+		close(c.deadlockNotifyCh)
+	})
+}
+
+type consumerReady struct {
+	readyCh   chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *consumerReady) waitReady() {
+	<-c.readyCh
+}
+
+func (c *consumerReady) markReady() {
+	c.closeOnce.Do(func() {
+		close(c.readyCh)
+	})
 }
 
 // New is a constructor for a Consumer
 func New(params Params) (*Consumer, error) {
+	// global deadlock detector
 	deadlockDetector := newDeadlockDetector(params.MetricsFactory, params.Logger, params.DeadlockCheckInterval)
+	// new Consumer
 	return &Consumer{
-		metricsFactory:      params.MetricsFactory,
-		logger:              params.Logger,
-		internalConsumer:    params.InternalConsumer,
-		processorFactory:    params.ProcessorFactory,
-		deadlockDetector:    deadlockDetector,
-		partitionIDToState:  make(map[int32]*consumerState),
+		metricsFactory:   params.MetricsFactory,
+		logger:           params.Logger,
+		internalConsumer: params.InternalConsumer,
+		processorFactory: params.ProcessorFactory,
+		deadlockDetector: &globalDeadlockDetector{
+			deadlockDetector: &deadlockDetector,
+			deadlockNotifyCh: make(chan struct{}, 1),
+		},
 		partitionsHeldGauge: partitionsHeldGauge(params.MetricsFactory),
+		consumerReady: &consumerReady{
+			readyCh: make(chan struct{}, 1),
+		},
+		topic: params.ProcessorFactory.topic,
 	}, nil
 }
 
 // Start begins consuming messages in a go routine
 func (c *Consumer) Start() {
 	c.deadlockDetector.start()
-	go func() {
-		c.logger.Info("Starting main loop")
-		for pc := range c.internalConsumer.Partitions() {
-			c.partitionMapLock.Lock()
-			c.partitionIDToState[pc.Partition()] = &consumerState{partitionConsumer: pc}
-			c.partitionMapLock.Unlock()
-			c.partitionMetrics(pc.Partition()).startCounter.Inc(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
 
-			c.doneWg.Add(2)
-			go c.handleMessages(pc)
-			go c.handleErrors(pc.Partition(), pc.Errors())
-		}
+	c.doneWg.Add(1)
+	go func() {
+		defer c.doneWg.Done()
+
+		c.startConsume(ctx)
 	}()
+
+	go c.handleErrors(ctx)
+}
+
+func (c *Consumer) startConsume(ctx context.Context) {
+	topic := []string{c.topic}
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Error("ctx canceled")
+			return
+		default:
+			c.logger.Info("Topic", zap.Strings("topic", topic))
+			if err := c.internalConsumer.Consume(ctx, topic, c); err != nil {
+				c.logger.Error("Error from consumer", zap.Error(err))
+			}
+
+			c.consumerReady = &consumerReady{
+				readyCh: make(chan struct{}, 1),
+			}
+
+			// check if context was cancelled, signaling that the consumer should stop
+			if ctx.Err() != nil {
+				if c.cancel != nil {
+					c.cancel()
+				}
+			}
+		}
+	}
 }
 
 // Close closes the Consumer and underlying sarama consumer
@@ -95,82 +167,126 @@ func (c *Consumer) Close() error {
 	// Close the internal consumer, which will close each partition consumers' message and error channels.
 	c.logger.Info("Closing parent consumer")
 	err := c.internalConsumer.Close()
+	c.CloseDeadlockDetector()
 
-	c.logger.Debug("Closing deadlock detector")
-	c.deadlockDetector.close()
+	if c.cancel != nil {
+		c.cancel()
+	}
 
 	c.logger.Debug("Waiting for messages and errors to be handled")
-	c.doneWg.Wait()
+	c.WaitDone()
 
 	return err
 }
 
-// handleMessages handles incoming Kafka messages on a channel
-func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
-	c.logger.Info("Starting message handler", zap.Int32("partition", pc.Partition()))
-	c.partitionMapLock.Lock()
-	c.partitionsHeld++
-	c.partitionsHeldGauge.Update(c.partitionsHeld)
-	c.partitionMapLock.Unlock()
+// Ready wait consumer running
+func (c *Consumer) WaitReady() {
+	c.consumerReady.waitReady()
+}
+
+// Ready wait consumer done
+func (c *Consumer) WaitDone() {
+	c.doneWg.Wait()
+}
+
+// CloseDeadlockDetector close global deadlock detector and retain partition deadlock detector //for tests
+func (c *Consumer) CloseDeadlockDetector() {
+	c.deadlockDetector.close()
+}
+
+// DeadlockNotify wait a notify when there is a deadlock
+func (c *Consumer) WaitDeadlockNotify() {
+	<-c.deadlockDetector.deadlockNotify()
+}
+
+// Setup is run at the beginning of a new session, before ConsumeClaim
+func (c *Consumer) Setup(sarama.ConsumerGroupSession) error {
+	// Mark the consumer as ready
+	c.consumerReady.markReady()
+	return nil
+}
+
+// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
+func (c *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+func (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	c.partitionMetrics(claim.Partition()).startCounter.Inc(1)
+
+	return c.startMessagesLoop(session, claim)
+}
+
+func (c *Consumer) startMessagesLoop(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	return c.handleMessages(session, claim)
+}
+
+// handleMessages starting message handler
+func (c *Consumer) handleMessages(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	c.logger.Info("Starting message handler", zap.Int32("partition", claim.Partition()))
+
+	c.partitionsHeld.Add(1)
+	c.partitionsHeldGauge.Update(c.partitionsHeld.Load())
+
+	partitionDeadlockDetector := c.deadlockDetector.startMonitoringForPartition(claim.Partition())
+
 	defer func() {
-		c.closePartition(pc)
-		c.partitionMapLock.Lock()
-		c.partitionsHeld--
-		c.partitionsHeldGauge.Update(c.partitionsHeld)
-		c.partitionMapLock.Unlock()
-		c.doneWg.Done()
+		partitionDeadlockDetector.close()
+		c.closePartition(claim)
+		c.partitionsHeld.Add(-1)
+		c.partitionsHeldGauge.Update(c.partitionsHeld.Load())
 	}()
 
-	msgMetrics := c.newMsgMetrics(pc.Partition())
+	msgMetrics := c.newMsgMetrics(claim.Partition())
 
-	var msgProcessor processor.SpanProcessor
-
-	deadlockDetector := c.deadlockDetector.startMonitoringForPartition(pc.Partition())
-	defer deadlockDetector.close()
+	var msgProcessor processor.SpanProcessor = nil
 
 	for {
 		select {
-		case msg, ok := <-pc.Messages():
-			if !ok {
-				c.logger.Info("Message channel closed. ", zap.Int32("partition", pc.Partition()))
-				return
-			}
+		case msg := <-claim.Messages():
+
 			c.logger.Debug("Got msg", zap.Any("msg", msg))
 			msgMetrics.counter.Inc(1)
 			msgMetrics.offsetGauge.Update(msg.Offset)
-			msgMetrics.lagGauge.Update(pc.HighWaterMarkOffset() - msg.Offset - 1)
-			deadlockDetector.incrementMsgCount()
+			msgMetrics.lagGauge.Update(claim.HighWaterMarkOffset() - msg.Offset - 1)
+			partitionDeadlockDetector.incrementMsgCount()
 
 			if msgProcessor == nil {
-				msgProcessor = c.processorFactory.new(pc.Partition(), msg.Offset-1)
+				msgProcessor = c.processorFactory.new(session, claim, msg.Offset-1)
 				defer msgProcessor.Close()
 			}
 
 			msgProcessor.Process(saramaMessageWrapper{msg})
 
-		case <-deadlockDetector.closePartitionChannel():
-			c.logger.Info("Closing partition due to inactivity", zap.Int32("partition", pc.Partition()))
-			return
+		// Should return when `session.Context()` is done.
+		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
+		// https://github.com/Shopify/sarama/issues/1192
+		case <-session.Context().Done():
+			c.logger.Info("Session done", zap.Int32("partition", claim.Partition()))
+			return session.Context().Err()
+		case <-partitionDeadlockDetector.closePartitionChannel():
+			c.logger.Info("Closing partition due to inactivity", zap.Int32("partition", claim.Partition()))
+			c.deadlockDetector.markDeadlock()
+			return fmt.Errorf("closing partition[%d] due to inactivity", claim.Partition())
 		}
 	}
 }
 
-func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
-	c.logger.Info("Closing partition consumer", zap.Int32("partition", partitionConsumer.Partition()))
-	partitionConsumer.Close() // blocks until messages channel is drained
-	c.partitionMetrics(partitionConsumer.Partition()).closeCounter.Inc(1)
-	c.logger.Info("Closed partition consumer", zap.Int32("partition", partitionConsumer.Partition()))
+// closePartition close partition of consumer
+func (c *Consumer) closePartition(claim sarama.ConsumerGroupClaim) {
+	c.logger.Info("Closing partition consumer", zap.Int32("partition", claim.Partition()))
+	c.partitionMetrics(claim.Partition()).closeCounter.Inc(1)
 }
 
 // handleErrors handles incoming Kafka consumer errors on a channel
-func (c *Consumer) handleErrors(partition int32, errChan <-chan *sarama.ConsumerError) {
-	c.logger.Info("Starting error handler", zap.Int32("partition", partition))
-	defer c.doneWg.Done()
+func (c *Consumer) handleErrors(ctx context.Context) {
+	c.logger.Info("Starting error handler")
 
-	errMetrics := c.newErrMetrics(partition)
+	errChan := c.internalConsumer.Errors()
+	errMetrics := c.newErrMetrics()
 	for err := range errChan {
 		errMetrics.errCounter.Inc(1)
 		c.logger.Error("Error consuming from Kafka", zap.Error(err))
 	}
-	c.logger.Info("Finished handling errors", zap.Int32("partition", partition))
 }
