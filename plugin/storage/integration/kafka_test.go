@@ -97,7 +97,8 @@ func (s *KafkaIntegrationTestSuite) initialize() error {
 	if err != nil {
 		return err
 	}
-	spanConsumer.Start()
+	// start consume and wait consumer running
+	spanConsumer.StartWithReady()
 
 	s.SpanWriter = spanWriter
 	s.SpanReader = &ingester{traceStore}
