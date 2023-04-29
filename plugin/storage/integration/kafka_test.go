@@ -26,6 +26,7 @@ import (
 
 	"github.com/jaegertracing/jaeger/cmd/ingester/app"
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/builder"
+	"github.com/jaegertracing/jaeger/cmd/ingester/app/consumer"
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/config"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
@@ -93,12 +94,11 @@ func (s *KafkaIntegrationTestSuite) initialize() error {
 	options := app.Options{}
 	options.InitFromViper(v)
 	traceStore := memory.NewStore()
-	spanConsumer, err := builder.CreateConsumer(s.logger, metrics.NullFactory, traceStore, options)
+	spanConsumer, err := builder.CreateConsumer(s.logger, metrics.NullFactory, traceStore, options, consumer.WithWaitReady(true))
 	if err != nil {
 		return err
 	}
-	// start consume and wait consumer running
-	spanConsumer.StartWithReady()
+	spanConsumer.Start()
 
 	s.SpanWriter = spanWriter
 	s.SpanReader = &ingester{traceStore}

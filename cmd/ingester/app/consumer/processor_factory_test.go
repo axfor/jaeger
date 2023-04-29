@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor/mocks"
 	"github.com/jaegertracing/jaeger/pkg/metrics"
@@ -27,8 +28,8 @@ import (
 func Test_NewFactory(t *testing.T) {
 	params := ProcessorFactoryParams{}
 	newFactory, err := NewProcessorFactory(params)
-	assert.NoError(t, err)
-	assert.NotNil(t, newFactory)
+	require.NoError(t, err)
+	require.NotNil(t, newFactory)
 }
 
 type fakeService struct {
@@ -133,8 +134,8 @@ func Test_New(t *testing.T) {
 	}
 
 	newFactory, err := NewProcessorFactory(factoryParams)
-	assert.NoError(t, err)
-	assert.NotNil(t, newFactory)
+	require.NoError(t, err)
+	require.NotNil(t, newFactory)
 
 	session := &fakeConsumerGroupSession{}
 	claim := &fakeConsumerGroupClaim{}
@@ -144,13 +145,13 @@ func Test_New(t *testing.T) {
 	msg := &fakeMsg{}
 	processor.On("Process", msg).Return(nil)
 	err = sp.Process(msg)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sp.Close()
 
-	assert.True(t, session.topic == msg.Topic())
-	assert.True(t, session.partition == msg.Partition())
-	assert.True(t, session.offset == msg.Offset())
+	assert.Equal(t, session.topic, msg.Topic())
+	assert.Equal(t, session.partition, msg.Partition())
+	assert.Equal(t, session.offset, msg.Offset())
 
 	t.Logf("processor all logs: %s", logBuf.String())
 }

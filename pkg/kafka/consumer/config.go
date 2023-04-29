@@ -17,6 +17,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/Shopify/sarama"
 	"go.uber.org/zap"
@@ -28,7 +29,7 @@ import (
 type Consumer interface {
 	Consume(ctx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error
 	Errors() <-chan error
-	Close() error
+	io.Closer
 }
 
 // Builder builds a new kafka consumer

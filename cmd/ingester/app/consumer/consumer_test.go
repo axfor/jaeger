@@ -58,19 +58,26 @@ func TestSaramaConsumerWrapper_MarkPartitionOffset(t *testing.T) {
 }
 
 type Store struct {
-	store    *memory.Store
-	consumer *Consumer
-	done     sync.WaitGroup
-	t        *testing.T
+	store          *memory.Store
+	spanWrite      sync.WaitGroup
+	spanWritedOnce sync.Once
+	t              *testing.T
 }
 
 func (s *Store) WriteSpan(ctx context.Context, span *model.Span) error {
 	err := s.store.WriteSpan(ctx, span)
-	go func() {
-		s.consumer.Close()
-		s.done.Done()
-	}()
 	require.NoError(s.t, err)
+	//
+	//  1: start      consume -> 2: goroutine in sarama
+	//  <--- 3: return <---|         |
+	//  |                            |---> 2.2: consumeClaim -> 2.3: handleMessages -> 2.4: messageLoop -> 2.5: process -> 2.6: parallel process for goroutine
+	//  |                                                                                                                          |
+	// \|/                                                                                                                         |---> 2.7: writeSpan -> 2.8: spanWrite(memory) -> 2.9: spanWrite done ->  2.10: messageLoop in sarama -> ...
+	//  |---> 3.2: spanWrite.wait() ->  3.3: consumer.Close() ->  3.4: finish !!!
+	//
+	s.spanWritedOnce.Do(func() {
+		s.spanWrite.Done()
+	})
 	return err
 }
 
@@ -132,13 +139,12 @@ func TestGroupConsumer(t *testing.T) {
 	unmarshaller := kafka.NewJSONUnmarshaller()
 	innerSpanWriter := memory.NewStore()
 
-	spanWriter := &Store{
+	sw := &Store{
 		store: innerSpanWriter,
 	}
-	spanWriter.done.Add(1)
 
 	spParams := processor.SpanProcessorParams{
-		Writer:       spanWriter,
+		Writer:       sw,
 		Unmarshaller: unmarshaller,
 	}
 
@@ -165,17 +171,19 @@ func TestGroupConsumer(t *testing.T) {
 		DeadlockCheckInterval: 0,
 	}
 
-	consumer, err := New(consumerParams)
+	consumer, err := New(consumerParams, WithWaitReady(true))
 	require.NoError(t, err)
 
-	spanWriter.consumer = consumer
-	spanWriter.t = t
+	sw.t = t
+	sw.spanWrite.Add(1)
 
-	consumer.StartWithReady()
+	consumer.Start()
 
 	t.Log("Consumer is ready and wait message")
 
-	spanWriter.done.Wait()
+	sw.spanWrite.Wait()
+
+	consumer.Close()
 
 	t.Logf("Consumer all logs: %s", logBuf.String())
 }
@@ -268,13 +276,12 @@ func TestGroupConsumerWithDeadlockDetector(t *testing.T) {
 	unmarshaller := kafka.NewJSONUnmarshaller()
 	innerSpanWriter := memory.NewStore()
 
-	spanWriter := &Store{
+	sw := &Store{
 		store: innerSpanWriter,
 	}
-	spanWriter.done.Add(1)
 
 	spParams := processor.SpanProcessorParams{
-		Writer:       spanWriter,
+		Writer:       sw,
 		Unmarshaller: unmarshaller,
 	}
 
@@ -303,16 +310,17 @@ func TestGroupConsumerWithDeadlockDetector(t *testing.T) {
 		DeadlockCheckInterval: time.Microsecond * 100,
 	}
 
-	consumer, err := New(consumerParams)
+	consumer, err := New(consumerParams,
+		WithGlobalDeadlockDetectorEnabled(false),
+		WithWaitReady(true),
+	)
 	require.NoError(t, err)
 
-	spanWriter.consumer = consumer
-	spanWriter.t = t
+	sw.t = t
 
-	// Start begins consuming and wait is running and disable global deadlock detector,
-	// There are two deadlock detectors, one global and one specially partition
-	// If the consumer is running, the specially partition deadlock detector takes effect
-	consumer.startWithReadyAndDisableGlobalDeadlockDetector()
+	sw.spanWrite.Add(1)
+
+	consumer.Start()
 
 	t.Log("Consumer is ready and wait message")
 

@@ -29,6 +29,20 @@ import (
 	"github.com/jaegertracing/jaeger/pkg/metrics"
 )
 
+type Option func(c *Consumer)
+
+func WithGlobalDeadlockDetectorEnabled(enabled bool) Option {
+	return func(c *Consumer) {
+		c.globalDeadlockDetectorEnabled = enabled
+	}
+}
+
+func WithWaitReady(waitReady bool) Option {
+	return func(c *Consumer) {
+		c.waitReady = waitReady
+	}
+}
+
 // Params are the parameters of a Consumer
 type Params struct {
 	ProcessorFactory      ProcessorFactory
@@ -46,13 +60,15 @@ type Consumer struct {
 	internalConsumer consumer.Consumer
 	processorFactory ProcessorFactory
 
-	deadlockDetector   deadlockDetector
-	deadlockNotifyCh   chan struct{}
-	deadlockNotifyOnce sync.Once
+	deadlockDetector              deadlockDetector
+	deadlockNotifyCh              chan struct{}
+	deadlockNotifyOnce            sync.Once
+	globalDeadlockDetectorEnabled bool // defailt is enabled
 
 	partitionsHeld      atomic.Int64
 	partitionsHeldGauge metrics.Gauge
 
+	waitReady     bool // defailt is not wait
 	consumerReady *consumerReady
 
 	doneWg sync.WaitGroup
@@ -81,46 +97,37 @@ func (c *consumerReady) close() {
 }
 
 // New is a constructor for a Consumer
-func New(params Params) (*Consumer, error) {
+func New(params Params, opts ...Option) (*Consumer, error) {
 	deadlockDetector := newDeadlockDetector(params.MetricsFactory, params.Logger, params.DeadlockCheckInterval)
-	// new Consumer
-	return &Consumer{
-		metricsFactory:      params.MetricsFactory,
-		logger:              params.Logger,
-		internalConsumer:    params.InternalConsumer,
-		processorFactory:    params.ProcessorFactory,
-		deadlockDetector:    deadlockDetector,
-		deadlockNotifyCh:    make(chan struct{}, 1),
-		partitionsHeldGauge: partitionsHeldGauge(params.MetricsFactory),
+	c := &Consumer{
+		metricsFactory:                params.MetricsFactory,
+		logger:                        params.Logger,
+		internalConsumer:              params.InternalConsumer,
+		processorFactory:              params.ProcessorFactory,
+		deadlockDetector:              deadlockDetector,
+		deadlockNotifyCh:              make(chan struct{}, 1),
+		globalDeadlockDetectorEnabled: true,
+		partitionsHeldGauge:           partitionsHeldGauge(params.MetricsFactory),
 		consumerReady: &consumerReady{
 			readyCh: make(chan struct{}, 1),
 		},
-		topic: params.ProcessorFactory.topic,
-	}, nil
-}
+		waitReady: false,
+		topic:     params.ProcessorFactory.topic,
+	}
 
-// Start begins consuming messages in a go routine
-func (c *Consumer) Start() {
-	c.doStart(true)
-}
+	for _, opt := range opts {
+		opt(c)
+	}
 
-// Start begins consuming messages in a go routine and consumer is running
-func (c *Consumer) StartWithReady() {
-	c.Start()
-	c.consumerReady.waitReady()
-}
-
-// Start begins consuming and wait is running and disable global deadlock detector,
-// There are two deadlock detectors, one global and one specially partition
-// If the consumer is running, the specially partition deadlock detector takes effect
-func (c *Consumer) startWithReadyAndDisableGlobalDeadlockDetector() {
-	c.doStart(false)
-	c.consumerReady.waitReady()
+	return c, nil
 }
 
 // doStart begins consuming messages in a go routine
-func (c *Consumer) doStart(startAllPartitionDeadlockDetector bool) {
-	if startAllPartitionDeadlockDetector {
+func (c *Consumer) Start() {
+	// Start begins consuming and wait is running and disable global deadlock detector,
+	// There are two deadlock detectors, one global and one specially partition
+	// If the consumer is running, the specially partition deadlock detector takes effect
+	if c.globalDeadlockDetectorEnabled {
 		// all partition deadlock detector
 		c.deadlockDetector.start()
 	}
@@ -135,6 +142,10 @@ func (c *Consumer) doStart(startAllPartitionDeadlockDetector bool) {
 	}()
 
 	go c.handleErrors(ctx)
+
+	if c.waitReady {
+		c.consumerReady.waitReady()
+	}
 }
 
 func (c *Consumer) startConsume(ctx context.Context) {
@@ -214,11 +225,6 @@ func (c *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
 // ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
 func (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	c.partitionMetrics(claim.Partition()).startCounter.Inc(1)
-
-	return c.startMessagesLoop(session, claim)
-}
-
-func (c *Consumer) startMessagesLoop(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	return c.handleMessages(session, claim)
 }
 
